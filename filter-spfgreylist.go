@@ -29,27 +29,30 @@ import (
 	"log"
 
 	"blitiri.com.ar/go/spf"
+	"go.netsend.nl/ossec"
 )
 
 type session struct {
-	id       string
-	tm	 int64
+	id string
+	tm int64
 
-	ip	 net.IP
+	ip       net.IP
 	heloName string
 	userName string
 
-	mailFrom string
+	mailFrom   string
 	fromDomain string
-	rcptTo	 string
+	rcptTo     string
 
-	ok	 bool
-	local_sender	 bool
+	ok           bool
+	local_sender bool
 }
+
 var sessions = make(map[string]*session)
 
 var whitelist_src = make(map[string]int64)
 var whitelist_domain = make(map[string]int64)
+var whitelist_domain_static = []string{}
 var wl_src_mux sync.Mutex
 var wl_dom_mux sync.Mutex
 
@@ -58,15 +61,14 @@ var greylist_domain = make(map[string]int64)
 var gl_src_mux sync.Mutex
 var gl_dom_mux sync.Mutex
 
-
-var passtime	*int64
-var greyexp	*int64
-var whiteexp	*int64
-var ip_wl	*string
-var domain_wl	*string
+var passtime int64
+var greyexp  int64
+var whiteexp int64
+var ip_wl *string
+var domain_wl *string
 var spfdomainwl *bool
 
-var version	string
+var version string
 
 var outputChannel chan string
 
@@ -75,12 +77,12 @@ var reporters = map[string]func(*session, []string){
 	"link-disconnect": linkDisconnect,
 	"link-identify":   linkIdentify,
 	"link-auth":       linkAuth,
-	"tx-mail":	   txMail,
-	"tx-rcpt":	   txRcpt,
+	"tx-mail":         txMail,
+	"tx-rcpt":         txRcpt,
 }
 
 var filters = map[string]func(*session, []string){
-	"rcpt-to":	rcptTo,
+	"rcpt-to": rcptTo,
 }
 
 func produceOutput(msgType string, sessionId string, token string, format string, a ...interface{}) {
@@ -112,10 +114,10 @@ func linkConnect(s *session, params []string) {
 	s.tm = int64(time.Now().Unix())
 	src := params[2]
 	tmp := strings.Split(src, ":")
-	tmp = tmp[0:len(tmp)-1]
+	tmp = tmp[0 : len(tmp)-1]
 	src = strings.Join(tmp, ":")
 	if strings.HasPrefix(src, "[") {
-		src = src[1:len(src)-1]
+		src = src[1 : len(src)-1]
 	}
 
 	s.ip = net.ParseIP(src)
@@ -204,13 +206,12 @@ func txRcpt(s *session, params []string) {
 		mailaddr = strings.Join(params[1:len(params)-1], "|")
 		status = params[len(params)-1]
 	} else {
-		fmt.Fprintf(os.Stderr, "txMail: new Format\n")
 		_ = params[0]
 		status = params[1]
 		mailaddr = strings.Join(params[2:], "|")
 	}
 
-	if ! s.local_sender {
+	if !s.local_sender {
 		return
 	}
 
@@ -250,7 +251,7 @@ func rcptTo(s *session, params []string) {
 
 	key := fmt.Sprintf("ip=%s", s.ip.String())
 	if val, ok := whitelist_src[key]; ok {
-		if s.tm - val < *whiteexp {
+		if s.tm-val < whiteexp {
 			fmt.Fprintf(os.Stderr, "IP address %s is whitelisted\n", s.ip.String())
 			proceed(s.id, token)
 			whitelist_src[key] = s.tm
@@ -262,12 +263,23 @@ func rcptTo(s *session, params []string) {
 	defer wl_dom_mux.Unlock()
 
 	key = fmt.Sprintf("domain=%s", s.fromDomain)
-	if val, ok := whitelist_domain[key]; ok {
-		if s.tm - val < *whiteexp {
-			fmt.Fprintf(os.Stderr, "domain %s is whitelisted\n", s.fromDomain)
+	// if domain is in whitelist file from cmdline then proceed
+	for _, item := range whitelist_domain_static {
+		if item == key {
+			fmt.Fprintf(os.Stderr, "domain %s is whitelisted in %s\n", s.fromDomain, *domain_wl)
 			proceed(s.id, token)
-			whitelist_domain[key] = s.tm
 			return
+		}
+	}
+	if val, ok := whitelist_domain[key]; ok {
+		if s.tm-val < whiteexp {
+			res, _ := spf.CheckHostWithSender(s.ip, s.heloName, s.mailFrom)
+			if res == "pass" {
+				fmt.Fprintf(os.Stderr, "domain %s is whitelisted\n", s.fromDomain)
+				proceed(s.id, token)
+				whitelist_domain[key] = s.tm
+				return
+			}
 		}
 	}
 
@@ -279,17 +291,17 @@ func spfResolve(s *session, token string) {
 
 	spfAware := false
 	res, _ := spf.CheckHostWithSender(s.ip, s.heloName, s.mailFrom)
-	if (res == "pass") {
+	if res == "pass" {
 		spfAware = true
 	}
 
-	if (!spfAware) {
+	if !spfAware {
 		key := fmt.Sprintf("ip=%s:%s:%s", s.ip.String(), s.mailFrom, s.rcptTo)
 		gl_src_mux.Lock()
 		defer gl_src_mux.Unlock()
 		if val, ok := greylist_src[key]; ok {
 			delta := s.tm - val
-			if val != s.tm && delta < *greyexp && delta > *passtime {
+			if val != s.tm && delta < greyexp && delta > passtime {
 				fmt.Fprintf(os.Stderr, "IP %s added to whitelist\n", s.ip.String())
 				proceed(s.id, token)
 				key = fmt.Sprintf("ip=%s", s.ip.String())
@@ -307,7 +319,7 @@ func spfResolve(s *session, token string) {
 		greylist_src[key] = s.tm
 		reject(s.id, token)
 		return
-	}		
+	}
 
 	gl_dom_mux.Lock()
 	defer gl_dom_mux.Unlock()
@@ -316,7 +328,7 @@ func spfResolve(s *session, token string) {
 	if ! *spfdomainwl {
 		if val, ok := greylist_domain[key]; ok {
 			delta := s.tm - val
-			if val != s.tm && delta < *greyexp && delta > *passtime {
+			if val != s.tm && delta < greyexp && delta > passtime {
 				domain2whitelist = true
 			}
 		} else {
@@ -413,9 +425,9 @@ func loadWhitelists() {
 		for scanner.Scan() {
 			fmt.Fprintf(os.Stderr, "domain %s added to whitelist\n", scanner.Text())
 			key := fmt.Sprintf("domain=%s", scanner.Text())
-			whitelist_domain[key] = now
+			whitelist_domain_static = append(whitelist_domain_static, key)
 		}
-	
+
 		if err := scanner.Err(); err != nil {
 			log.Fatal(err)
 		}
@@ -423,15 +435,15 @@ func loadWhitelists() {
 }
 
 func listsManager() {
-	tick := time.Tick(60 * 1000 * time.Millisecond)
+	tick := time.Tick(time.Minute)
 	for {
 		select {
-		case <- tick:
+		case <-tick:
 			now := int64(time.Now().Unix())
 
 			gl_src_mux.Lock()
 			for key, value := range greylist_src {
-				if now - value > *greyexp {
+				if now-value > greyexp {
 					delete(greylist_src, key)
 				}
 			}
@@ -439,15 +451,15 @@ func listsManager() {
 
 			gl_dom_mux.Lock()
 			for key, value := range greylist_domain {
-				if now - value > *greyexp {
+				if now-value > greyexp {
 					delete(greylist_domain, key)
 				}
 			}
 			gl_dom_mux.Unlock()
-			
+
 			wl_src_mux.Lock()
 			for key, value := range whitelist_src {
-				if now - value > *whiteexp {
+				if now-value > whiteexp {
 					delete(whitelist_src, key)
 				}
 			}
@@ -455,7 +467,7 @@ func listsManager() {
 
 			wl_dom_mux.Lock()
 			for key, value := range whitelist_domain {
-				if now - value > *whiteexp {
+				if now-value > whiteexp {
 					delete(whitelist_domain, key)
 				}
 			}
@@ -465,16 +477,27 @@ func listsManager() {
 }
 
 func main() {
-	passtime  = flag.Int64("passtime", 300, "number of seconds before retries are accounted (default: 300)")
-	greyexp   = flag.Int64("greyexp", 4*3600, "number of seconds before greylist attempts expire (default: 4 hours)")
-	whiteexp  = flag.Int64("whiteexp", 30*86400, "number of seconds before whitelists expire (default: 30 days)")
-	ip_wl     = flag.String("wl-ip", "", "filename containing a list of IP addresses to whitelist, one per line")
+	flagPasstime := flag.Duration("passtime", 300*time.Second,      "duration before retries are accounted")
+	flagGreyexp  := flag.Duration("greyexp",  4*3600*time.Second,   "duration before greylist attempts expire")
+	flagWhiteexp := flag.Duration("whiteexp", 30*86400*time.Second, "duration before whitelists expire")
+	ip_wl = flag.String("wl-ip", "", "filename containing a list of IP addresses to whitelist, one per line")
 	domain_wl = flag.String("wl-domain", "", "filename containing a list of sender domains to whitelist, one per line")
 	spfdomainwl = flag.Bool("spfdomainwl", false, "when =true autowhitelist domains with valid SPF records")
 
 	flag.Parse()
 
+	passtime = int64(*flagPasstime / time.Second)
+	greyexp  = int64(*flagGreyexp  / time.Second)
+	whiteexp = int64(*flagWhiteexp / time.Second)
+
 	loadWhitelists()
+
+	err := ossec.PledgePromises("stdio inet dns")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pledge failed: %v\n", err)
+		os.Exit(1)
+	}
+
 	go listsManager()
 
 	scanner := bufio.NewScanner(os.Stdin)
